@@ -360,6 +360,12 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
 
+def _background_scheduler_capacity(_batch: _Batch) -> int:
+    """The shared async scheduler keeps the profile cap; session limits apply inside each batch."""
+    from tools.delegate_tool import _get_max_async_children
+    return _get_max_async_children()
+
+
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
@@ -379,7 +385,8 @@ def _dispatch_background(batch: _Batch) -> str:
         _detach_child(parent_agent, c)
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
-        parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
+        parent_session_id=getattr(parent_agent, "session_id", None),
+        max_async_children=_background_scheduler_capacity(batch),
     )
 
     units = _units_of(batch)

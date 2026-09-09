@@ -544,6 +544,15 @@ def _build_result_entry(
     return entry
 
 
+def _effective_child_timeout(child):
+    """Use the immutable launch snapshot, including explicit no-timeout; legacy children fall back to config."""
+    if hasattr(child, "_delegation_timeout"):
+        value = getattr(child, "_delegation_timeout")
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+    from tools.delegate_tool import _get_child_timeout
+    return _get_child_timeout()
+
+
 @dataclass
 class _ChildRun:
     """State of one child run, shared by every phase of ``_run_single_child``.
@@ -642,10 +651,10 @@ class _ChildRun:
         via a Future done-callback (``close_deferred=True``) — closing here would race its still-unwinding finally
         path.
         """
-        from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
+        from tools.delegate_tool import (_get_subagent_approval_callback, _set_subagent_approval_cb)
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
-        child_timeout = _get_child_timeout()
+        child_timeout = _effective_child_timeout(child)
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )

@@ -902,6 +902,8 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     stored runtime, or an unroutable provider → this session's picked model/effort/tier, else the default."""
     kw = {"session_db": session_db, "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
           "platform_override": _session_source(current)}
+    if current.get("delegation_override") is not None:
+        kw["delegation_override"] = current["delegation_override"]
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
@@ -954,12 +956,23 @@ def _await_resume_history(sid: str, current: dict) -> bool:
         return _sessions.get(sid) is current
 
 
+def _sync_agent_delegation_override(agent, override) -> None:
+    """Copy the live policy onto an agent and its next-session persistence seed."""
+    copied = copy.deepcopy(override)
+    agent._session_delegation_override = copied
+    if copied is None:
+        agent._session_init_model_config.pop("delegation", None)
+    else:
+        agent._session_init_model_config["delegation"] = copy.deepcopy(copied)
+
+
 def _attach_built_agent(current: dict, agent) -> None:
     """Attach a freshly built agent to its live record (session DB row deferred to first run_conversation())."""
     # Bot Mode gate hint: the DB title lands post-first-turn but the system prompt builds at turn START.
     if _title_hint := str(current.get("pending_title") or "").strip():
         agent._session_title_hint = _title_hint
     current["agent"] = agent
+    _sync_agent_delegation_override(agent, current.get("delegation_override"))
     _session_todo_state(current)
     # Baseline for the per-turn config sync (profile home override still active).
     current["config_model_seen"] = _config_model_target()
@@ -1485,11 +1498,15 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     if not row:
         return {}
     model_config = _parse_model_config(row.get("model_config"), quiet=True)
+    overrides: dict = {}
+    if isinstance(model_config.get("delegation"), dict):
+        from agent.delegation_policy import normalize_delegation_override
+        with contextlib.suppress(ValueError):
+            overrides["delegation_override"] = normalize_delegation_override(model_config["delegation"])
     _row_title = str(row.get("title") or "").strip()
     if (model_config.get("room_plumbing") or (row.get("hidden") and _row_title.startswith("Group:"))
             or model_config.get("follow_profile_config") or _row_title == "Bot Chat"):
-        return {}
-    overrides: dict = {}
+        return overrides
     field = lambda k: str(model_config.get(k) or "").strip()
     model = str(row.get("model") or model_config.get("model") or "").strip()
     # ``billing_provider`` is only the billing bucket — for a custom endpoint the bare class "custom", which
@@ -2262,7 +2279,8 @@ def _make_agent(
     sid: str, key: str, session_id: str | None = None, session_db=None,
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
-    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None):
+    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
+    delegation_override: dict | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2306,6 +2324,7 @@ def _make_agent(
         with _sessions_lock:
             context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(_sessions.get(sid))
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
+    _sync_agent_delegation_override(agent, delegation_override)
     return agent
 
 
@@ -2358,6 +2377,7 @@ def _init_session(
             "profile_home": profile_home,
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
+            "delegation_override": copy.deepcopy(getattr(agent, "_session_delegation_override", None)),
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
         }
@@ -2417,6 +2437,7 @@ def _deferred_session_record(
         "edit_snapshots": {}, "explicit_cwd": bool(explicit_cwd), "history": history,
         "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
         "inflight_turn": None, "last_active": now, "lazy": lazy, "model_override": model_override,
+        "delegation_override": copy.deepcopy((resume_runtime_overrides or {}).get("delegation_override")),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,

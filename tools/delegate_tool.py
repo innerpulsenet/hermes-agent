@@ -360,7 +360,7 @@ def _run_single_child(
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list,
+    live_deleg_id: Optional[str], live_writers: list, delegation_timeout: float = 0,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -387,6 +387,7 @@ def _build_children(
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
+            child._delegation_timeout = delegation_timeout if delegation_timeout > 0 else None
         except ValueError as exc:
             return [], str(exc)
         if _task_schema is not None:
@@ -405,6 +406,17 @@ def _build_children(
                 _ident_ref["delegation_id"] = live_deleg_id
         children.append((i, t, child))
     return children, None
+
+
+def _resolve_session_delegation_policy(parent_agent, cfg: dict) -> dict:
+    """Resolve one launch snapshot using the same normalized knobs as legacy delegation."""
+    from agent.delegation_policy import resolve_delegation_policy
+    global_policy = dict(cfg)
+    global_policy["max_concurrent_children"] = _get_max_concurrent_children()
+    global_policy["child_timeout_seconds"] = _get_child_timeout() or 0
+    raw_override = getattr(parent_agent, "_session_delegation_override", None)
+    override = raw_override if isinstance(raw_override, dict) else None
+    return resolve_delegation_policy(override, global_policy)
 
 
 def delegate_task(
@@ -448,7 +460,9 @@ def delegate_task(
         )
 
     cfg = _load_config()
-    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    policy = _resolve_session_delegation_policy(parent_agent, cfg)
+    effective_policy = policy["effective"]
+    default_max_iter = effective_policy["max_iterations"]
     # Caller-supplied max_iterations is ignored: the config value is authoritative
     # so budgets stay predictable (kwarg kept for internal callers/tests).
     if max_iterations is not None and max_iterations != default_max_iter:
@@ -459,14 +473,16 @@ def delegate_task(
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    routing_cfg = credentials_cfg if credentials_cfg is not None else {
+        **cfg, **{key: value for key, value in effective_policy.items() if value is not None}
+    }
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
         return tool_error(str(exc))
-    max_children = _get_max_concurrent_children()
+    max_children = effective_policy["max_concurrent_children"]
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
@@ -486,6 +502,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
+        delegation_timeout=effective_policy["child_timeout_seconds"],
     )
     if err:
         return tool_error(err)
