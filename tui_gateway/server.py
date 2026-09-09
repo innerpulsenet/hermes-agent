@@ -960,10 +960,15 @@ def _sync_agent_delegation_override(agent, override) -> None:
     """Copy the live policy onto an agent and its next-session persistence seed."""
     copied = copy.deepcopy(override)
     agent._session_delegation_override = copied
+    # The seed dict is built in _init_session_state; a partially built agent (or a
+    # test double) may not carry one, and the live policy above is what matters.
+    seed = getattr(agent, "_session_init_model_config", None)
+    if seed is None:
+        return
     if copied is None:
-        agent._session_init_model_config.pop("delegation", None)
+        seed.pop("delegation", None)
     else:
-        agent._session_init_model_config["delegation"] = copy.deepcopy(copied)
+        seed["delegation"] = copy.deepcopy(copied)
 
 
 def _attach_built_agent(current: dict, agent) -> None:

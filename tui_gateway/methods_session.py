@@ -368,13 +368,19 @@ def _branch_delegation_override(record: dict, parent_session_id: str, db):
             if parent is not None:
                 override = parent.get("delegation_override")
     if override is None:
-        row = db.get_session(parent_session_id)
-        model_config = _parse_model_config((row or {}).get("model_config"), quiet=True)
-        raw = model_config.get("delegation")
-        if isinstance(raw, dict):
-            from agent.delegation_policy import normalize_delegation_override
-            with contextlib.suppress(ValueError):
-                override = normalize_delegation_override(raw)
+        # Best-effort: an unreadable parent row means "no inherited policy" (the child
+        # falls back to profile defaults). It must never abort the branch-row seed and
+        # drop the caller into lazy row creation.
+        try:
+            row = db.get_session(parent_session_id)
+            model_config = _parse_model_config((row or {}).get("model_config"), quiet=True)
+            raw = model_config.get("delegation")
+            if isinstance(raw, dict):
+                from agent.delegation_policy import normalize_delegation_override
+                with contextlib.suppress(ValueError):
+                    override = normalize_delegation_override(raw)
+        except Exception:
+            logger.debug("delegation inheritance lookup failed for %s", parent_session_id, exc_info=True)
     copied = copy.deepcopy(override)
     record["delegation_override"] = copied
     return copied
