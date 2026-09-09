@@ -86,3 +86,28 @@ def test_session_call_limit_does_not_shrink_shared_background_scheduler():
     batch = SimpleNamespace(max_children=2)
     with patch("tools.delegate_tool._get_max_async_children", return_value=8):
         assert _background_scheduler_capacity(batch) == 8
+
+
+def test_session_reasoning_effort_overrides_the_profile_level():
+    """The session level must reach routing_cfg, which is what delegate_tool_config reads."""
+    parent = SimpleNamespace(_session_delegation_override={"reasoning_effort": "max"})
+    with patch("tools.delegate_tool._get_max_concurrent_children", return_value=6), \
+            patch("tools.delegate_tool._get_child_timeout", return_value=30):
+        policy = _resolve_session_delegation_policy(parent, {"reasoning_effort": "low"})
+
+    assert policy["effective"]["reasoning_effort"] == "max"
+    assert policy["inherited"]["reasoning_effort"] is False
+    # The merge delegate_task performs onto the profile config section.
+    routing = {"reasoning_effort": "low", **{k: v for k, v in policy["effective"].items() if v is not None}}
+    assert routing["reasoning_effort"] == "max"
+
+
+def test_unset_session_reasoning_effort_leaves_the_profile_level_alone():
+    parent = SimpleNamespace(_session_delegation_override={"max_iterations": 7})
+    with patch("tools.delegate_tool._get_max_concurrent_children", return_value=6), \
+            patch("tools.delegate_tool._get_child_timeout", return_value=30):
+        policy = _resolve_session_delegation_policy(parent, {"reasoning_effort": "low"})
+
+    assert policy["effective"]["reasoning_effort"] == "low"
+    routing = {"reasoning_effort": "low", **{k: v for k, v in policy["effective"].items() if v is not None}}
+    assert routing["reasoning_effort"] == "low"
