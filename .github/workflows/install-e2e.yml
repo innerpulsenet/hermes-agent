@@ -39,6 +39,10 @@ name: Install & Update E2E
 #     update FROM changes, and the moment a broken updater would strand them;
 #   * manually, where you can pick the route and how many releases to sample.
 #
+# Forks inherit this workflow but have no release tags, so pick-releases would
+# fail-closed every 12 hours. Scheduled and tag-push runs skip on forks;
+# workflow_dispatch still runs (the picker fetches upstream tags).
+#
 # Deliberately NOT on pull_request: a leg takes ~11 minutes of real toolchain
 # installation, and the matrix multiplies that. Updating is release-shaped work,
 # so it is gated on releases and the clock instead.
@@ -84,6 +88,9 @@ jobs:
   # OS's matrix so all combos cover the same set.
   pick-releases:
     name: Pick release tags
+    # Forks have no v* release tags. Skip the clock/tag-push path so a fork
+    # does not fail-closed every 12 hours; dispatch remains an opt-in.
+    if: ${{ !github.event.repository.fork || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -246,7 +253,9 @@ jobs:
   # the per-OS aggregates.
   report:
     name: Result chart
-    if: always()
+    # always() so a failed OS matrix still gets a chart; skip when there was
+    # nothing to chart (pick-releases skipped on a fork, or cancelled).
+    if: ${{ always() && !cancelled() && needs.pick-releases.result == 'success' }}
     needs: [leg-player, pick-releases, linux, windows, macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
