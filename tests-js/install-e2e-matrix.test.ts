@@ -25,6 +25,7 @@ describe('parseTagsJson', () => {
       encoding: 'utf8',
       input: '',
     })
+
     expect(r.status, r.stderr).toBe(0)
     expect(r.stdout).toContain('### Install & Update E2E results')
   })
@@ -36,12 +37,17 @@ describe('pick-release-tags', () => {
 
   function git(cwd: string, ...args: string[]) {
     const r = spawnSync('git', ['-c', 'init.defaultBranch=main', ...args], { cwd, encoding: 'utf8', env })
-    if (r.status !== 0) throw new Error(r.stderr || r.stdout)
+
+    if (r.status !== 0) {
+      throw new Error(r.stderr || r.stdout)
+    }
+
     return r
   }
 
   it('fails closed on a checkout with no release tags (and does not fetch unless GITHUB_ACTIONS=true)', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'pick-tags-empty-'))
+
     try {
       git(dir, 'init')
       git(dir, 'config', 'user.email', 't@example.com')
@@ -59,6 +65,7 @@ describe('pick-release-tags', () => {
 
   it('emits oldest and newest when asked for two', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'pick-tags-span-'))
+
     try {
       git(dir, 'init')
       git(dir, 'config', 'user.email', 't@example.com')
@@ -66,7 +73,10 @@ describe('pick-release-tags', () => {
       writeFileSync(path.join(dir, 'f'), 'x')
       git(dir, 'add', 'f')
       git(dir, 'commit', '-m', 'init')
-      for (const tag of ['v2026.1.1', 'v2026.6.1', 'v2026.9.11']) git(dir, 'tag', tag)
+
+      for (const tag of ['v2026.1.1', 'v2026.6.1', 'v2026.9.11']) {
+        git(dir, 'tag', tag)
+      }
       const r = spawnSync('bash', [picker, '--repo', dir, '--count', '2'], { encoding: 'utf8', env })
       expect(r.status, r.stderr).toBe(0)
       expect(JSON.parse(r.stdout)).toEqual(['v2026.1.1', 'v2026.9.11'])

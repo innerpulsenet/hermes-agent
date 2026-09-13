@@ -47,6 +47,10 @@ on:
       - 'package-lock.json'
   workflow_dispatch:
 
+# Forks have no GitHub App and GITHUB_TOKEN cannot create PRs
+# ("GitHub Actions is not permitted to create or approve pull requests").
+# Skip rather than fail-closed on every JS push to main.
+
 permissions:
   contents: read # default; apply-patch job overrides to write
 
@@ -57,6 +61,7 @@ concurrency:
 jobs:
   generate-patch:
     name: Generate eslint --fix patch
+    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
