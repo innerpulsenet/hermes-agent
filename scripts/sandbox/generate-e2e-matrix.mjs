@@ -91,6 +91,23 @@ export function legId(name) {
   return name.replace(/[^A-Za-z0-9._-]+/g, '-');
 }
 
+/**
+ * Parse `--tags`. Empty/whitespace is `[]` -- the report job passes
+ * `needs.pick-releases.outputs.tags`, which is the empty string when that
+ * job is skipped or failed, and JSON.parse('') throws.
+ * @param {string | undefined} raw
+ * @returns {TagAnnotation[]}
+ */
+export function parseTagsJson(raw) {
+  const s = (raw ?? '').trim();
+  if (!s) return [];
+  const parsed = JSON.parse(s);
+  if (!Array.isArray(parsed)) {
+    throw new Error('tags must be a JSON array');
+  }
+  return parsed;
+}
+
 /** @type {Record<Os, OsSpec>} */
 export const SPEC = {
   windows: {
@@ -417,7 +434,7 @@ async function main() {
   });
   if (values.format === 'results') {
     const jobs = (await readStdin()).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+    const annotations = parseTagsJson(values.tags);
     /** @type {Map<string, number>} */
     const artifactById = new Map();
     if (values.artifacts) {
@@ -430,7 +447,7 @@ async function main() {
     process.stdout.write(renderMarkdownResults(jobs, annotations, artifactById));
     return;
   }
-  const tags = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+  const tags = parseTagsJson(values.tags);
   const envs = generateEnvironments(SPEC);
   if (values.format === 'markdown') {
     process.stdout.write(renderMarkdownPlan(envs, tags));

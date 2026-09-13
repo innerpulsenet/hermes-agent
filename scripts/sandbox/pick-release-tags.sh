@@ -22,7 +22,10 @@
 # Reads tags from the local checkout, so it needs one fetched with tags
 # (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
 # checkout has no tags and this exits non-zero rather than silently emitting an
-# empty matrix.
+# empty matrix. Exception: under GitHub Actions, a checkout with no release
+# tags (typical of a fork) fetches v* from PICK_RELEASE_UPSTREAM, defaulting
+# to the canonical NousResearch/hermes-agent repo -- those are the versions
+# a user would actually update FROM.
 #
 # Only vYYYY.M.D[.N] release tags are considered; the repo also carries
 # backup/* and one-off tags that are not releases.
@@ -73,10 +76,26 @@ mapfile -t tags < <(
 )
 
 total="${#tags[@]}"
+if [ "$total" -eq 0 ] && [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+  # Forks inherit this workflow but do not mirror upstream release tags.
+  # The versions a user updates FROM live on the canonical repo.
+  upstream="${PICK_RELEASE_UPSTREAM:-https://github.com/NousResearch/hermes-agent.git}"
+  echo "warning: no release tags in $REPO; fetching v* from $upstream" >&2
+  if git -C "$REPO" fetch --no-recurse-submodules "$upstream" '+refs/tags/v*:refs/tags/v*'; then
+    mapfile -t tags < <(
+      git -C "$REPO" tag --list 'v*' \
+        | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+        | sort -V
+    )
+    total="${#tags[@]}"
+  fi
+fi
 if [ "$total" -eq 0 ]; then
   echo "error: no release tags found in $REPO" >&2
   echo '       A shallow clone has no tags: fetch with tags (actions/checkout' >&2
   echo '       with fetch-depth: 0, or fetch-tags: true).' >&2
+  echo '       Forks: set GITHUB_ACTIONS=true to fetch from PICK_RELEASE_UPSTREAM' >&2
+  echo '       (default https://github.com/NousResearch/hermes-agent.git).' >&2
   exit 1
 fi
 
