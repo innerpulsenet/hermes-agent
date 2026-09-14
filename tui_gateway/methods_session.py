@@ -5,6 +5,7 @@ helpers (``_sessions``, ``_ok``, ``_err``, ...) bare; module-level helpers are p
 server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 
 import contextlib
+import copy
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -31,6 +32,99 @@ _with_live_session = _session_arg(lambda params, rid: _sess(params, rid))  # wai
 def _session_method(name: str, *, live: bool = False):
     """``@method(name)`` over ``_with_live_session`` (waits for the agent build) or ``_with_session``."""
     return lambda fn: method(name)((_with_live_session if live else _with_session)(fn))
+
+
+def _delegation_global_config(session: dict | None = None) -> dict:
+    from hermes_cli.config import load_config_readonly
+    from tools.delegate_tool_config import _get_child_timeout, _get_max_concurrent_children
+    profile_home = session.get("profile_home") if session else None
+    with _profile_build_scope(profile_home):
+        config = load_config_readonly()
+        value = config.get("delegation", {}) if isinstance(config, dict) else {}
+        result = dict(value) if isinstance(value, dict) else {}
+        result["max_concurrent_children"] = _get_max_concurrent_children()
+        result["child_timeout_seconds"] = _get_child_timeout() or 0
+    return result
+
+
+def _delegation_payload(session: dict) -> dict:
+    from agent.delegation_policy import resolve_delegation_policy
+    return resolve_delegation_policy(session.get("delegation_override"), _delegation_global_config(session))
+
+
+def _delegation_active_child(session: dict, runtime_session_id: str) -> bool:
+    agent = session.get("agent")
+    if agent is not None:
+        children = getattr(agent, "_active_children", None)
+        children_lock = getattr(agent, "_active_children_lock", None)
+        if children_lock is not None:
+            with children_lock:
+                if children:
+                    return True
+        elif children:
+            return True
+
+    from tools.async_delegation import has_live_for_session
+    if has_live_for_session(
+        session_key=str(session.get("session_key") or ""),
+        origin_ui_session_id=runtime_session_id,
+        parent_session_id=str(getattr(agent, "session_id", "") or ""),
+    ):
+        return True
+
+    from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock, _subagent_transport_matches
+    transport = session.get("transport") or current_transport()
+    with _active_subagents_lock:
+        return any(r.get("owner_session_id") == runtime_session_id
+                   and _subagent_transport_matches(r, transport)
+                   and r.get("owner_session_record") is session
+                   for r in _active_subagents.values())
+
+
+@_session_method("session.delegation.get")
+def _(rid, params: dict, session: dict) -> dict:
+    return _ok(rid, _delegation_payload(session))
+
+
+@_session_method("session.delegation.set")
+def _(rid, params: dict, session: dict) -> dict:
+    from agent.delegation_policy import normalize_delegation_override
+    try:
+        override = normalize_delegation_override(params.get("config"))
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
+    if override is None:
+        return _err(rid, 4004, "config must be an object; use session.delegation.reset to clear it")
+    if _delegation_active_child(session, _str_param(params, "session_id")):
+        return _err(rid, 4090, "cannot change delegation policy while a child is active")
+    key = session.get("session_key", "")
+    try:
+        with _session_db(session) as db:
+            if db is not None and db.get_session(key):
+                db.patch_session_model_config(key, {"delegation": override})
+    except Exception as exc:
+        return _err(rid, 5000, f"delegation update failed: {exc}")
+    session["delegation_override"] = override
+    if session.get("agent") is not None:
+        _sync_agent_delegation_override(session["agent"], override)
+    return _ok(rid, _delegation_payload(session))
+
+
+@_session_method("session.delegation.reset")
+def _(rid, params: dict, session: dict) -> dict:
+    if _delegation_active_child(session, _str_param(params, "session_id")):
+        return _err(rid, 4090, "cannot change delegation policy while a child is active")
+    key = session.get("session_key", "")
+    try:
+        with _session_db(session) as db:
+            if db is not None and db.get_session(key):
+                db.patch_session_model_config(key, {"delegation": None})
+    except Exception as exc:
+        return _err(rid, 5000, f"delegation reset failed: {exc}")
+    session.pop("delegation_override", None)
+    if session.get("agent") is not None:
+        _sync_agent_delegation_override(session["agent"], None)
+    return _ok(rid, _delegation_payload(session))
 
 
 def _with_db(code: int, *, session_scoped: bool):
@@ -228,13 +322,16 @@ def _billing_pending_change(result: dict) -> dict:
 
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
-                    copy_fields=(), compensate: bool = False) -> None:
+                    copy_fields=(), compensate: bool = False, delegation_override=None) -> None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
     deletes a committed row whose transcript/title failed (a durable-but-empty row would defeat the INSERT OR
     IGNORE first-prompt seed) — except on disk-full, where the delete cannot land."""
-    db.create_session(new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
+    model_config = {"_branched_from": parent_key}
+    if delegation_override is not None:
+        model_config["delegation"] = copy.deepcopy(delegation_override)
+    db.create_session(new_key, source=source, model=_resolve_model(), model_config=model_config,
                       parent_session_id=parent_key, cwd=cwd, profile_name=profile_name)
     try:
         # Compensation guard (#93959 review): if the transcript copy or title write fails AFTER the row
@@ -258,6 +355,37 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
         raise
 
 
+def _branch_delegation_override(record: dict, parent_session_id: str, db):
+    """Copy a branch parent's live policy, falling back to its durable session row."""
+    override = record.get("delegation_override")
+    if override is None:
+        with _sessions_lock:
+            parent = next(
+                (candidate for candidate in _sessions.values()
+                 if candidate.get("session_key") == parent_session_id),
+                None,
+            )
+            if parent is not None:
+                override = parent.get("delegation_override")
+    if override is None:
+        # Best-effort: an unreadable parent row means "no inherited policy" (the child
+        # falls back to profile defaults). It must never abort the branch-row seed and
+        # drop the caller into lazy row creation.
+        try:
+            row = db.get_session(parent_session_id)
+            model_config = _parse_model_config((row or {}).get("model_config"), quiet=True)
+            raw = model_config.get("delegation")
+            if isinstance(raw, dict):
+                from agent.delegation_policy import normalize_delegation_override
+                with contextlib.suppress(ValueError):
+                    override = normalize_delegation_override(raw)
+        except Exception:
+            logger.debug("delegation inheritance lookup failed for %s", parent_session_id, exc_info=True)
+    copied = copy.deepcopy(override)
+    record["delegation_override"] = copied
+    return copied
+
+
 def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: list, source: str, profile_home):
     """Persist a seeded desktop branch child NOW (the one session.create exception to lazy rows): the
     renderer's post-create resume re-fetches it via REST/defer_history, so an unpersisted child 404s and
@@ -266,9 +394,11 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
         with _session_db(record) as db:
             if db is None:
                 return
+            delegation_override = _branch_delegation_override(record, parent_session_id, db)
             _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
                             source=source, cwd=record["cwd"],
-                            profile_name=profile_name_for_home(profile_home) or _current_profile_name(), compensate=True)
+                            profile_name=profile_name_for_home(profile_home) or _current_profile_name(), compensate=True,
+                            delegation_override=delegation_override)
             record["pending_title"] = None
     except Exception:
         logger.warning("seeded-branch persistence failed for %s; falling back to lazy row creation", key,
@@ -295,8 +425,13 @@ def _create_overrides(params: dict) -> tuple:
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    from agent.delegation_policy import normalize_delegation_override
     (sid, source), key = _new_runtime_ids(params), _new_session_key()
     history = _coerce_seed_history(params.get("messages"))
+    try:
+        delegation_override = normalize_delegation_override(params.get("delegation"))
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
     # Branch: links back so list_sessions_rich keeps it visible and the sidebar nests it.
     parent_session_id = _str_param(params, "parent_session_id") or None
     # Only an explicitly chosen existing workspace persists as cwd; the launch-dir fallback is "No workspace".
@@ -318,6 +453,7 @@ def _(rid, params: dict) -> dict:
             "explicit_cwd": explicit_cwd,
             "history": history, "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
             "cwd": _completion_cwd(params), "inflight_turn": None, "last_active": now,
+            "delegation_override": delegation_override,
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
@@ -1865,7 +2001,8 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
     try:
         with _profile_build_scope(parent_home):
             agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
-                                           context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session))
+                                           context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
+                                           delegation_override=copy.deepcopy(session.get("delegation_override")))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))
@@ -1923,7 +2060,8 @@ def _(rid, params: dict, session: dict) -> dict:
             home = session.get("profile_home")
             _persist_branch(db, new_key, old_key, title, history, source=source, cwd=_session_cwd(session),
                             profile_name=profile_name_for_home(home) or _current_profile_name(),
-                            copy_fields=_BRANCH_COPY_FIELDS)
+                            copy_fields=_BRANCH_COPY_FIELDS,
+                            delegation_override=copy.deepcopy(session.get("delegation_override")))
         except Exception as e:
             return _err(rid, 5008, f"branch failed: {e}")
     try:
